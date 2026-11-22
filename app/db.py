@@ -6,6 +6,18 @@ The schema deliberately separates raw experiment input (``exposures`` and
 the raw rows and the affected analysis rows inside one ``BEGIN IMMEDIATE``
 transaction, so a failed analysis write can never leave the raw input or the
 previous result half-updated.
+
+Schema versions (``PRAGMA user_version``)
+-----------------------------------------
+
+``1``
+    Adds ``session_variant_first``: one row per session/variant holding that
+    session's earliest exposure for the variant.  The table is maintained by
+    every exposure insert with a single indexed upsert, so re-deriving an
+    account reads one row per bound session/variant instead of rescanning the
+    whole exposure history of the account.  Databases created at version 0
+    are upgraded once at startup, including a full backfill and analysis
+    rebuild so the stored result equals a from-scratch recomputation.
 """
 
 from __future__ import annotations
@@ -15,6 +27,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+SCHEMA_VERSION = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS exposures (
@@ -29,6 +43,10 @@ CREATE INDEX IF NOT EXISTS idx_exposures_session
     ON exposures (session_id);
 CREATE INDEX IF NOT EXISTS idx_exposures_variant
     ON exposures (variant);
+-- Supports the per-session/variant first-exposure lookups without a table
+-- scan when the materialised table is rebuilt.
+CREATE INDEX IF NOT EXISTS idx_exposures_session_variant
+    ON exposures (session_id, variant, occurred_us);
 
 CREATE TABLE IF NOT EXISTS session_bindings (
     session_id TEXT PRIMARY KEY,
@@ -37,6 +55,17 @@ CREATE TABLE IF NOT EXISTS session_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_bindings_account
     ON session_bindings (account_id);
+
+-- Earliest exposure of each session for each variant.  Maintained
+-- incrementally on insert; this is the bounded-read source that keeps
+-- account derivation independent of the number of stored exposures.
+CREATE TABLE IF NOT EXISTS session_variant_first (
+    session_id   TEXT NOT NULL,
+    variant      TEXT NOT NULL,
+    exposure_id  TEXT NOT NULL,
+    occurred_us  INTEGER NOT NULL,
+    PRIMARY KEY (session_id, variant)
+);
 
 -- Accounts that only saw one variant.  One row per account.
 CREATE TABLE IF NOT EXISTS analysis_samples (
@@ -88,11 +117,17 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def init_db(path: Path) -> None:
+    """Create or upgrade the database, including one-time data migrations."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(path)
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        # Imported lazily to avoid an import cycle at module load time.
+        from .experiment import upgrade_schema
+
+        upgrade_schema(conn)
     finally:
         conn.close()
 

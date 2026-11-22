@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    image: news-guide-ab:latest
+    container_name: news-guide-ab
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/experiment.sqlite3
+    volumes:
+      - experiment-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  experiment-data:

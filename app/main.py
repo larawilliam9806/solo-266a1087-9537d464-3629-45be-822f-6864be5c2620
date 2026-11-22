@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -49,25 +48,19 @@ from .db import (
 )
 from .experiment import (
     ExposureConflict,
-    bind,
     derive_account,
+    derive_affected,
     load_analysis,
     persist_analysis,
     save_exposure,
+    stage_binding,
     touch_analysis,
+    utc_now,
 )
 from .models import BindingIn, ExposureIn
 
 EXPOSURE_BATCH_LIMIT = 10_000
 BINDING_BATCH_LIMIT = 10_000
-
-
-def utc_now() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
 
 
 def _parse_exposures(payload: Any) -> tuple[list[ExposureIn], bool]:
@@ -152,36 +145,49 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                 ).fetchone()
                 if row is not None:
                     affected.add(row["account_id"])
+        # Each affected account is re-derived once from its per-session/variant
+        # first-exposure rows, no matter how many exposures were backfilled.
         for account_id in sorted(affected):
             derive_account(conn, account_id)
         if created and affected:
             touch_analysis(conn, utc_now())
         return results, created
 
-    def _apply_binding(conn: sqlite3.Connection, item: BindingIn) -> dict[str, Any]:
-        previous = conn.execute(
-            "SELECT account_id FROM session_bindings WHERE session_id = ?",
-            (item.session_id,),
-        ).fetchone()
-        previous_account = previous["account_id"] if previous else None
-        outcome = bind(conn, item.session_id, item.account_id)
-        if item.account_id is None:
-            status = "unbound" if outcome == "unbound" else "unchanged"
-        elif outcome == "unchanged":
-            status = "unchanged"
-        elif previous_account is None:
-            status = "bound"
-        else:
-            status = "rebound"
-        if outcome != "unchanged":
+    def _apply_bindings(
+        conn: sqlite3.Connection, items: Sequence[BindingIn]
+    ) -> list[dict[str, Any]]:
+        # Stage every raw binding change first, remembering the ownership each
+        # item saw at its own point in the submission order.  The union of
+        # affected accounts is then re-derived exactly once per account, so a
+        # batch moving many sessions onto one account never re-reads that
+        # account's history once per item.
+        changes = []
+        results: list[dict[str, Any]] = []
+        for item in items:
+            change = stage_binding(conn, item.session_id, item.account_id)
+            changes.append(change)
+            previous_account = change.previous_account_id
+            if not change.changed:
+                status = "unchanged"
+            elif item.account_id is None:
+                status = "unbound"
+            elif previous_account is None:
+                status = "bound"
+            else:
+                status = "rebound"
+            results.append(
+                {
+                    "session_id": item.session_id,
+                    "session_no": item.session_id,
+                    "account_id": item.account_id,
+                    "previous_account_id": previous_account,
+                    "status": status,
+                }
+            )
+        affected = derive_affected(conn, changes)
+        if affected:
             touch_analysis(conn, utc_now())
-        return {
-            "session_id": item.session_id,
-            "session_no": item.session_id,
-            "account_id": item.account_id,
-            "previous_account_id": previous_account,
-            "status": status,
-        }
+        return results
 
     def _analysis_payload(conn: sqlite3.Connection) -> dict[str, Any]:
         stored = load_analysis(conn)
@@ -333,7 +339,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     ):
         items, is_batch = _parse_bindings(payload)
         with transaction(conn):
-            results = [_apply_binding(conn, item) for item in items]
+            results = _apply_bindings(conn, items)
         if is_batch:
             return {"results": results}
         return JSONResponse(status_code=200, content=results[0])
@@ -350,7 +356,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             body = {"session_id": session_id, "account_id": payload}
         item = BindingIn.model_validate(body)
         with transaction(conn):
-            return _apply_binding(conn, item)
+            return _apply_bindings(conn, [item])[0]
 
     @app.delete("/bindings/{session_id}", tags=["bindings"])
     def delete_binding(
@@ -359,7 +365,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         item = BindingIn.model_validate({"session_id": session_id, "account_id": None})
         with transaction(conn):
-            return _apply_binding(conn, item)
+            return _apply_bindings(conn, [item])[0]
 
     @app.get("/bindings", tags=["bindings"])
     def list_bindings(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
